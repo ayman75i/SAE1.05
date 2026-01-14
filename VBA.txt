@@ -1,0 +1,312 @@
+Sub GenererRapportReseau()
+    ' ============================================
+    ' SAÉ 1.05
+    ' ============================================
+
+    Dim srcSheet As Worksheet, outSheet As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim totalPkts As Long, totalBytes As Double
+    Dim i As Long, j As Long
+    
+    ' Dictionnaires pour le stockage des données
+    Dim mapIP As Object, mapBytes As Object
+    Dim mapPorts As Object, mapSyn As Object
+    Dim mapProto As Object, mapHours As Object
+    
+    ' Variables de traitement de ligne
+    Dim ts As String, proto As String, srcIP As String
+    Dim dstPort As String, flag As String, pktLen As Variant
+    Dim hourPart As String, byteVal As Long
+    
+    ' Gestion des anomalies
+    Dim listAnomalies As Collection
+    Dim key As Variant, subKey As Variant
+    Dim countPorts As Object
+    Dim tempVal As Long
+    
+    ' Constantes de colonnes (pour la lisibilité)
+    Const COL_TIME = 1
+    Const COL_PROTO = 2
+    Const COL_SRC = 3
+    Const COL_PORT = 6
+    Const COL_FLAG = 7
+    Const COL_LEN = 11
+
+    Application.ScreenUpdating = False
+
+    ' --- INITIALISATION ---
+    Set mapIP = CreateObject("Scripting.Dictionary")
+    Set mapBytes = CreateObject("Scripting.Dictionary")
+    Set mapPorts = CreateObject("Scripting.Dictionary")  ' Stocke "IP|Port"
+    Set mapSyn = CreateObject("Scripting.Dictionary")
+    Set mapProto = CreateObject("Scripting.Dictionary")
+    Set mapHours = CreateObject("Scripting.Dictionary")
+    Set listAnomalies = New Collection
+
+    Set srcSheet = ActiveSheet
+
+    ' --- PRÉPARATION DE LA FEUILLE DE SORTIE ---
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    Worksheets("Analyse Réseau").Delete
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+
+    Set outSheet = Worksheets.Add
+    outSheet.Name = "Analyse Réseau"
+
+    ' --- LECTURE DES DONNÉES ---
+    lastRow = srcSheet.Cells(srcSheet.Rows.Count, 1).End(xlUp).Row
+    totalPkts = lastRow - 1
+
+    For r = 2 To lastRow
+        ' Extraction sécurisée des données
+        On Error Resume Next
+        ts = CStr(srcSheet.Cells(r, COL_TIME).Value)
+        proto = CStr(srcSheet.Cells(r, COL_PROTO).Value)
+        srcIP = CStr(srcSheet.Cells(r, COL_SRC).Value)
+        dstPort = CStr(srcSheet.Cells(r, COL_PORT).Value)
+        flag = CStr(srcSheet.Cells(r, COL_FLAG).Value)
+        pktLen = srcSheet.Cells(r, COL_LEN).Value
+        On Error GoTo 0
+
+        ' Traitement uniquement si IP source existe
+        If Len(srcIP) > 0 Then
+            
+            ' Normalisation Protocole
+            If Len(proto) = 0 Then proto = "IP"
+
+            ' Comptage IP
+            If Not mapIP.Exists(srcIP) Then
+                mapIP(srcIP) = 0
+                mapBytes(srcIP) = 0
+            End If
+            mapIP(srcIP) = mapIP(srcIP) + 1
+
+            ' Somme des Octets
+            byteVal = 0
+            If IsNumeric(pktLen) Then byteVal = CLng(pktLen)
+            mapBytes(srcIP) = mapBytes(srcIP) + byteVal
+
+            ' Extraction de l'heure
+            hourPart = "15" ' Valeur par défaut comme dans l'original
+            If InStr(ts, ":") > 0 Then
+                On Error Resume Next
+                hourPart = Split(ts, ":")(0)
+                On Error GoTo 0
+            End If
+            If Not mapHours.Exists(hourPart) Then mapHours(hourPart) = 0
+            mapHours(hourPart) = mapHours(hourPart) + 1
+
+            ' Comptage Protocoles
+            If Not mapProto.Exists(proto) Then mapProto(proto) = 0
+            mapProto(proto) = mapProto(proto) + 1
+
+            ' Tracking des Ports Uniques (IP + Port)
+            If Len(dstPort) > 0 And dstPort <> "N/A" Then
+                Dim portKey As String
+                portKey = srcIP & "|" & dstPort
+                If Not mapPorts.Exists(portKey) Then mapPorts.Add portKey, srcIP
+            End If
+
+            ' Comptage des SYN
+            If flag = "S" Then
+                If Not mapSyn.Exists(srcIP) Then mapSyn(srcIP) = 0
+                mapSyn(srcIP) = mapSyn(srcIP) + 1
+            End If
+        End If
+    Next r
+
+    ' --- DÉTECTION DES ANOMALIES ---
+    
+    ' 1. SYN Flood (> 100)
+    For Each key In mapSyn.Keys
+        If mapSyn(key) > 100 Then
+            listAnomalies.Add "SYN FLOOD|" & key & "|" & mapSyn(key) & "|ELEVEE"
+        End If
+    Next
+
+    ' 2. Port Scan (> 50 ports uniques)
+    Set countPorts = CreateObject("Scripting.Dictionary")
+    For Each key In mapPorts.Keys
+        Dim ipOwner As String
+        ipOwner = mapPorts(key)
+        If Not countPorts.Exists(ipOwner) Then countPorts(ipOwner) = 0
+        countPorts(ipOwner) = countPorts(ipOwner) + 1
+    Next
+    
+    For Each key In countPorts.Keys
+        If countPorts(key) > 50 Then
+            listAnomalies.Add "PORT SCAN|" & key & "|" & countPorts(key) & "|MOYENNE"
+        End If
+    Next
+
+    ' 3. Volumetric Flood (> 40% du trafic)
+    For Each key In mapIP.Keys
+        If (mapIP(key) * 100 / totalPkts) > 40 Then
+            listAnomalies.Add "FLOOD|" & key & "|" & mapIP(key) & "|ELEVEE"
+        End If
+    Next
+
+    ' --- TRI DES IP (Top 10) ---
+    ' Transfert dictionnaire vers tableau pour le tri
+    Dim sortArr() As Variant
+    ReDim sortArr(1 To mapIP.Count, 1 To 2)
+    Dim idx As Long
+    idx = 1
+    
+    For Each key In mapIP.Keys
+        sortArr(idx, 1) = CStr(key)
+        sortArr(idx, 2) = CLng(mapIP(key))
+        idx = idx + 1
+    Next
+
+    ' Tri à bulles (Bubble Sort)
+    Dim tmpKey As Variant, tmpVal As Variant
+    For i = 1 To mapIP.Count - 1
+        For j = i + 1 To mapIP.Count
+            If sortArr(j, 2) > sortArr(i, 2) Then
+                ' Swap
+                tmpKey = sortArr(i, 1): sortArr(i, 1) = sortArr(j, 1): sortArr(j, 1) = tmpKey
+                tmpVal = sortArr(i, 2): sortArr(i, 2) = sortArr(j, 2): sortArr(j, 2) = tmpVal
+            End If
+        Next
+    Next
+
+    ' Calcul volume total global
+    totalBytes = 0
+    For Each key In mapBytes.Keys
+        totalBytes = totalBytes + mapBytes(key)
+    Next
+
+    ' --- GÉNÉRATION DU RAPPORT (AFFICHAGE) ---
+    
+    With outSheet
+        ' Titres
+        .Cells(1, 1).Value = "RAPPORT D'ANALYSE RÉSEAU - SAÉ 1.05"
+        .Cells(1, 1).Font.Bold = True: .Cells(1, 1).Font.Size = 16
+        .Cells(2, 1).Value = "BUT Réseaux & Télécommunications"
+
+        ' Résumé
+        .Cells(4, 1).Value = "RÉSUMÉ"
+        .Cells(4, 1).Font.Bold = True: .Cells(4, 1).Font.Size = 14
+        
+        If listAnomalies.Count > 0 Then
+            .Cells(5, 1).Value = "⚠️ " & listAnomalies.Count & " anomalie(s) détectée(s) !"
+            .Cells(5, 1).Font.Color = RGB(255, 0, 0)
+        Else
+            .Cells(5, 1).Value = "✅ Aucune anomalie"
+            .Cells(5, 1).Font.Color = RGB(0, 150, 0)
+        End If
+
+        ' Stats Générales
+        .Cells(7, 1).Value = "STATISTIQUES GÉNÉRALES"
+        .Cells(7, 1).Font.Bold = True: .Cells(7, 1).Font.Size = 14
+        
+        .Cells(8, 1).Value = "Total de paquets :"
+        .Cells(8, 2).Value = totalPkts
+        .Cells(9, 1).Value = "Volume total :"
+        .Cells(9, 2).Value = Round(totalBytes / 1024, 2) & " Ko"
+        .Cells(10, 1).Value = "IP sources :"
+        .Cells(10, 2).Value = mapIP.Count
+        .Cells(11, 1).Value = "Protocoles :"
+        .Cells(11, 2).Value = mapProto.Count
+
+        ' Tableau Top 10 IP
+        .Cells(13, 1).Value = "TOP 10 IP SOURCES"
+        .Cells(13, 1).Font.Bold = True: .Cells(13, 1).Font.Size = 14
+        
+        With .Range("A14:E14")
+            .Value = Array("Rang", "IP", "Paquets", "%", "Volume (Ko)")
+            .Font.Bold = True
+            .Interior.Color = RGB(220, 220, 220)
+        End With
+
+        Dim limit As Long
+        limit = IIf(mapIP.Count < 10, mapIP.Count, 10)
+        
+        For i = 1 To limit
+            .Cells(14 + i, 1).Value = i
+            .Cells(14 + i, 2).Value = sortArr(i, 1)
+            .Cells(14 + i, 3).Value = sortArr(i, 2)
+            .Cells(14 + i, 4).Value = Round((sortArr(i, 2) / totalPkts) * 100, 1) & "%"
+            .Cells(14 + i, 5).Value = Round(mapBytes(sortArr(i, 1)) / 1024, 2)
+        Next i
+
+        ' Tableau Protocoles
+        .Cells(27, 1).Value = "PROTOCOLES DÉTECTÉS"
+        .Cells(27, 1).Font.Bold = True: .Cells(27, 1).Font.Size = 14
+        With .Range("A28:B28")
+            .Value = Array("Protocole", "Paquets")
+            .Font.Bold = True
+            .Interior.Color = RGB(220, 220, 220)
+        End With
+
+        idx = 29
+        For Each key In mapProto.Keys
+            .Cells(idx, 1).Value = key
+            .Cells(idx, 2).Value = mapProto(key)
+            idx = idx + 1
+        Next
+
+        ' Tableau Anomalies
+        .Cells(32, 1).Value = "⚠️ ANOMALIES DÉTECTÉES"
+        .Cells(32, 1).Font.Bold = True: .Cells(32, 1).Font.Size = 14
+        .Cells(32, 1).Font.Color = RGB(255, 0, 0)
+
+        If listAnomalies.Count = 0 Then
+            .Cells(33, 1).Value = "Aucune anomalie"
+            .Cells(33, 1).Font.Color = RGB(0, 150, 0)
+        Else
+            With .Range("A33:D33")
+                .Value = Array("Type", "IP", "Nombre", "Gravité")
+                .Font.Bold = True
+                .Interior.Color = RGB(220, 220, 220)
+            End With
+
+            idx = 34
+            For i = 1 To listAnomalies.Count
+                Dim info() As String
+                info = Split(listAnomalies(i), "|")
+                .Cells(idx, 1).Value = info(0)
+                .Cells(idx, 2).Value = info(1)
+                .Cells(idx, 3).Value = info(2)
+                .Cells(idx, 4).Value = info(3)
+                .Range(.Cells(idx, 1), .Cells(idx, 4)).Interior.Color = RGB(255, 200, 200)
+                idx = idx + 1
+            Next
+        End If
+
+        ' Conclusion et Pied de page
+        Dim endLine As Long
+        endLine = 38 + listAnomalies.Count
+        
+        .Cells(endLine, 1).Value = "CONCLUSION"
+        .Cells(endLine, 1).Font.Bold = True: .Cells(endLine, 1).Font.Size = 14
+        
+        If listAnomalies.Count > 0 Then
+            .Cells(endLine + 1, 1).Value = "Des anomalies ont été détectées. Mesures de sécurité nécessaires."
+        Else
+            .Cells(endLine + 1, 1).Value = "Trafic normal. Pas d'anomalie."
+        End If
+
+        .Cells(endLine + 3, 1).Value = "📊 POUR LES GRAPHIQUES :"
+        .Cells(endLine + 3, 1).Font.Bold = True
+        .Cells(endLine + 3, 1).Font.Size = 12
+        .Cells(endLine + 4, 1).Value = "Exécute le script Python (Extraction_CSV_A_MARKDOWN.py)"
+        .Cells(endLine + 5, 1).Value = "Il créera les 4 graphiques + le camembert dans le dossier resultats_interface/"
+
+        .Columns("A:E").AutoFit
+        .Activate
+        .Range("A1").Select
+    End With
+
+    Application.ScreenUpdating = True
+
+    MsgBox "Analyse terminée !" & vbCrLf & vbCrLf & _
+           "Paquets analysés : " & totalPkts & vbCrLf & _
+           "Anomalies trouvées : " & listAnomalies.Count & vbCrLf & vbCrLf & _
+           "POUR LES GRAPHIQUES :" & vbCrLf & _
+           "Lance le script Python qui créera les images !", vbInformation, "Terminé !"
+
+End Sub
